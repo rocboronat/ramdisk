@@ -1,122 +1,850 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const MemDiskApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+enum RamDiskBackend { none, imdisk }
 
-  // This widget is the root of your application.
+class MemDiskApp extends StatelessWidget {
+  const MemDiskApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
+      title: 'MemDisk',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0A0A0F),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF00E5FF),
+          secondary: Color(0xFFFF3D71),
+          surface: Color(0xFF1A1A1A),
+        ),
+        fontFamily: 'Segoe UI',
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const RamDiskScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class RamDiskScreen extends StatefulWidget {
+  const RamDiskScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<RamDiskScreen> createState() => _RamDiskScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _RamDiskScreenState extends State<RamDiskScreen>
+    with SingleTickerProviderStateMixin {
+  bool _isRunning = false;
+  bool _isLoading = false;
+  String _statusMessage = 'Checking for RAM disk driver...';
+  String _driveLetter = 'R';
+  final int _sizeGB = 1;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+  RamDiskBackend _backend = RamDiskBackend.none;
+  bool _showInstallDialog = false;
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.08).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _detectBackend();
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _detectBackend() async {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isLoading = true;
+      _statusMessage = 'Detecting RAM disk driver...';
     });
+
+    // Check for ImDisk
+    try {
+      final result = await Process.run('where', ['imdisk']);
+      if (result.exitCode == 0) {
+        setState(() {
+          _backend = RamDiskBackend.imdisk;
+          _statusMessage = 'Ready — ImDisk driver detected';
+          _isLoading = false;
+        });
+        return;
+      }
+    } catch (_) {}
+
+    // No backend found
+    setState(() {
+      _backend = RamDiskBackend.none;
+      _statusMessage = 'No RAM disk driver found';
+      _isLoading = false;
+      _showInstallDialog = true;
+    });
+  }
+
+  Future<void> _installImDisk() async {
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Installing ImDisk via winget...';
+      _showInstallDialog = false;
+    });
+
+    try {
+      // Try winget first
+      final result = await Process.run(
+        'winget',
+        ['install', '--id', 'ImDisk.Toolkit', '-e', '--accept-source-agreements', '--accept-package-agreements'],
+        runInShell: true,
+      );
+
+      if (result.exitCode == 0) {
+        setState(() {
+          _statusMessage = 'ImDisk installed! Please restart the app.';
+        });
+        // Re-detect after install
+        await Future.delayed(const Duration(seconds: 2));
+        await _detectBackend();
+      } else {
+        setState(() {
+          _statusMessage = 'Install failed. Try manual installation.';
+          _showInstallDialog = true;
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = 'Install failed: $e';
+        _showInstallDialog = true;
+      });
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _startRamDisk() async {
+    if (_backend == RamDiskBackend.none) {
+      setState(() {
+        _showInstallDialog = true;
+      });
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Creating RAM Disk...';
+    });
+
+    try {
+      final sizeBytes = _sizeGB * 1024 * 1024 * 1024;
+      
+      if (_backend == RamDiskBackend.imdisk) {
+        // Create RAM disk using ImDisk
+        final result = await Process.run(
+          'imdisk',
+          ['-a', '-s', '$sizeBytes', '-m', '$_driveLetter:', '-p', '/fs:ntfs /q /y'],
+          runInShell: true,
+        );
+
+        if (result.exitCode == 0) {
+          setState(() {
+            _isRunning = true;
+            _statusMessage = 'RAM Disk active on $_driveLetter: (${_sizeGB}GB)';
+          });
+          _pulseController.repeat(reverse: true);
+        } else {
+          final errorMsg = result.stderr.toString().trim();
+          setState(() {
+            _statusMessage = errorMsg.isNotEmpty ? errorMsg : 'Failed to create RAM disk';
+          });
+        }
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = 'Error: $e';
+      });
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _stopRamDisk() async {
+    setState(() {
+      _isLoading = true;
+      _statusMessage = 'Removing RAM Disk...';
+    });
+
+    try {
+      if (_backend == RamDiskBackend.imdisk) {
+        var result = await Process.run(
+          'imdisk',
+          ['-d', '-m', '$_driveLetter:'],
+          runInShell: true,
+        );
+
+        if (result.exitCode != 0) {
+          // Try force remove
+          result = await Process.run(
+            'imdisk',
+            ['-D', '-m', '$_driveLetter:'],
+            runInShell: true,
+          );
+        }
+
+        if (result.exitCode == 0) {
+          _pulseController.stop();
+          _pulseController.reset();
+          setState(() {
+            _isRunning = false;
+            _statusMessage = 'RAM Disk stopped';
+          });
+        } else {
+          setState(() {
+            _statusMessage = 'Failed to remove RAM disk';
+          });
+        }
+      }
+    } catch (e) {
+      setState(() {
+        _statusMessage = 'Error: $e';
+      });
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  void _copyCommand(String command) {
+    Clipboard.setData(ClipboardData(text: command));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('Command copied to clipboard'),
+        backgroundColor: const Color(0xFF00E5FF).withValues(alpha: 0.9),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Stack(
+        children: [
+          // Background
+          Container(
+            decoration: const BoxDecoration(
+              gradient: RadialGradient(
+                center: Alignment.topCenter,
+                radius: 1.5,
+                colors: [
+                  Color(0xFF0F1922),
+                  Color(0xFF0A0A0F),
+                ],
+              ),
             ),
-          ],
-        ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+          ),
+          // Grid pattern overlay
+          CustomPaint(
+            size: Size.infinite,
+            painter: _GridPainter(),
+          ),
+          // Main content
+          SafeArea(
+            child: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  // Title
+                  ShaderMask(
+                    shaderCallback: (bounds) => const LinearGradient(
+                      colors: [Color(0xFF00E5FF), Color(0xFF00B8D4)],
+                    ).createShader(bounds),
+                    child: const Text(
+                      'MEMDISK',
+                      style: TextStyle(
+                        fontSize: 52,
+                        fontWeight: FontWeight.w200,
+                        letterSpacing: 20,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'RAM DISK MANAGER',
+                    style: TextStyle(
+                      fontSize: 11,
+                      letterSpacing: 6,
+                      color: Colors.white.withValues(alpha: 0.35),
+                    ),
+                  ),
+                  const SizedBox(height: 70),
+
+                  // Main Button
+                  AnimatedBuilder(
+                    animation: _pulseAnimation,
+                    builder: (context, child) {
+                      return Transform.scale(
+                        scale: _isRunning ? _pulseAnimation.value : 1.0,
+                        child: child,
+                      );
+                    },
+                    child: GestureDetector(
+                      onTap: _isLoading || _backend == RamDiskBackend.none
+                          ? (_backend == RamDiskBackend.none && !_isLoading
+                              ? () => setState(() => _showInstallDialog = true)
+                              : null)
+                          : (_isRunning ? _stopRamDisk : _startRamDisk),
+                      child: Container(
+                        width: 200,
+                        height: 200,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: RadialGradient(
+                            colors: _isRunning
+                                ? [
+                                    const Color(0xFF00E5FF).withValues(alpha: 0.25),
+                                    const Color(0xFF00E5FF).withValues(alpha: 0.02),
+                                  ]
+                                : _backend == RamDiskBackend.none
+                                    ? [
+                                        const Color(0xFF1A1A1A),
+                                        const Color(0xFF0F0F0F),
+                                      ]
+                                    : [
+                                        const Color(0xFF1E2A30),
+                                        const Color(0xFF12181C),
+                                      ],
+                          ),
+                          border: Border.all(
+                            color: _isRunning
+                                ? const Color(0xFF00E5FF)
+                                : _backend == RamDiskBackend.none
+                                    ? Colors.white.withValues(alpha: 0.08)
+                                    : const Color(0xFF00E5FF).withValues(alpha: 0.3),
+                            width: 2,
+                          ),
+                          boxShadow: _isRunning
+                              ? [
+                                  BoxShadow(
+                                    color: const Color(0xFF00E5FF).withValues(alpha: 0.35),
+                                    blurRadius: 40,
+                                    spreadRadius: 2,
+                                  ),
+                                  BoxShadow(
+                                    color: const Color(0xFF00E5FF).withValues(alpha: 0.15),
+                                    blurRadius: 80,
+                                    spreadRadius: 10,
+                                  ),
+                                ]
+                              : [],
+                        ),
+                        child: Center(
+                          child: _isLoading
+                              ? const SizedBox(
+                                  width: 36,
+                                  height: 36,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    valueColor: AlwaysStoppedAnimation<Color>(
+                                      Color(0xFF00E5FF),
+                                    ),
+                                  ),
+                                )
+                              : Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      _backend == RamDiskBackend.none
+                                          ? Icons.download_rounded
+                                          : _isRunning
+                                              ? Icons.stop_rounded
+                                              : Icons.play_arrow_rounded,
+                                      size: 56,
+                                      color: _isRunning
+                                          ? const Color(0xFF00E5FF)
+                                          : _backend == RamDiskBackend.none
+                                              ? Colors.white.withValues(alpha: 0.4)
+                                              : Colors.white.withValues(alpha: 0.8),
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      _backend == RamDiskBackend.none
+                                          ? 'INSTALL'
+                                          : _isRunning
+                                              ? 'STOP'
+                                              : 'START',
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.w300,
+                                        letterSpacing: 4,
+                                        color: _isRunning
+                                            ? const Color(0xFF00E5FF)
+                                            : _backend == RamDiskBackend.none
+                                                ? Colors.white.withValues(alpha: 0.4)
+                                                : Colors.white.withValues(alpha: 0.8),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 50),
+
+                  // Status
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.03),
+                      borderRadius: BorderRadius.circular(30),
+                      border: Border.all(
+                        color: _isRunning
+                            ? const Color(0xFF00E5FF).withValues(alpha: 0.25)
+                            : Colors.white.withValues(alpha: 0.06),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: _isRunning
+                                ? const Color(0xFF00E5FF)
+                                : _backend != RamDiskBackend.none
+                                    ? const Color(0xFF4CAF50)
+                                    : Colors.orange.withValues(alpha: 0.7),
+                            boxShadow: _isRunning
+                                ? [
+                                    const BoxShadow(
+                                      color: Color(0xFF00E5FF),
+                                      blurRadius: 8,
+                                    ),
+                                  ]
+                                : [],
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 350),
+                          child: Text(
+                            _statusMessage,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: Colors.white.withValues(alpha: 0.65),
+                              letterSpacing: 0.5,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 40),
+
+                  // Drive letter and size selector
+                  if (_backend != RamDiskBackend.none && !_isRunning && !_isLoading)
+                    _buildSettings(),
+                ],
+              ),
+            ),
+          ),
+
+          // Install dialog overlay
+          if (_showInstallDialog) _buildInstallDialog(),
+        ],
       ),
     );
   }
+
+  Widget _buildSettings() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.06),
+        ),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _buildSettingItem(
+            'DRIVE',
+            DropdownButton<String>(
+              value: _driveLetter,
+              dropdownColor: const Color(0xFF1A1A1A),
+              underline: const SizedBox(),
+              isDense: true,
+              style: const TextStyle(
+                color: Color(0xFF00E5FF),
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+              ),
+              items: ['R', 'Z', 'Y', 'X', 'W', 'V']
+                  .map((letter) => DropdownMenuItem(
+                        value: letter,
+                        child: Text('$letter:'),
+                      ))
+                  .toList(),
+              onChanged: (value) {
+                if (value != null) {
+                  setState(() {
+                    _driveLetter = value;
+                  });
+                }
+              },
+            ),
+          ),
+          const SizedBox(width: 40),
+          _buildSettingItem(
+            'SIZE',
+            Text(
+              '${_sizeGB}GB',
+              style: const TextStyle(
+                color: Color(0xFF00E5FF),
+                fontSize: 15,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSettingItem(String label, Widget child) {
+    return Column(
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            fontSize: 10,
+            letterSpacing: 2,
+            color: Colors.white.withValues(alpha: 0.35),
+          ),
+        ),
+        const SizedBox(height: 8),
+        child,
+      ],
+    );
+  }
+
+  Widget _buildInstallDialog() {
+    return GestureDetector(
+      onTap: () => setState(() => _showInstallDialog = false),
+      child: Container(
+        color: Colors.black.withValues(alpha: 0.7),
+        child: Center(
+          child: GestureDetector(
+            onTap: () {}, // Prevent closing when tapping dialog
+              child: Container(
+              width: 450,
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(context).size.height * 0.85,
+              ),
+              decoration: BoxDecoration(
+                color: const Color(0xFF12161A),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.1),
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 40,
+                  ),
+                ],
+              ),
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(28),
+                child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF00E5FF).withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(
+                          Icons.memory,
+                          color: Color(0xFF00E5FF),
+                          size: 28,
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Driver Required',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.w500,
+                                color: Colors.white,
+                              ),
+                            ),
+                            SizedBox(height: 4),
+                            Text(
+                              'Install ImDisk Toolkit to create RAM disks',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: Colors.white54,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: () => setState(() => _showInstallDialog = false),
+                        icon: Icon(
+                          Icons.close,
+                          color: Colors.white.withValues(alpha: 0.5),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 28),
+                  
+                  // Option 1: Winget
+                  _buildInstallOption(
+                    icon: Icons.terminal,
+                    title: 'Install via Winget',
+                    subtitle: 'Recommended — automatic installation',
+                    command: 'winget install ImDisk.Toolkit',
+                    onInstall: _installImDisk,
+                  ),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // Option 2: Chocolatey
+                  _buildInstallOption(
+                    icon: Icons.folder_zip,
+                    title: 'Install via Chocolatey',
+                    subtitle: 'Run in admin PowerShell',
+                    command: 'choco install imdisk-toolkit -y',
+                  ),
+                  
+                  const SizedBox(height: 16),
+                  
+                  // Option 3: Manual
+                  _buildInstallOption(
+                    icon: Icons.download,
+                    title: 'Manual Download',
+                    subtitle: 'Download from SourceForge',
+                    command: 'https://sourceforge.net/projects/imdisk-toolkit/',
+                    isUrl: true,
+                  ),
+
+                  const SizedBox(height: 24),
+                  
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.amber.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.amber.withValues(alpha: 0.2),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.info_outline,
+                          color: Colors.amber.withValues(alpha: 0.8),
+                          size: 20,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'ImDisk Toolkit is open-source and still maintained via package managers (latest: Feb 2025).',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.white.withValues(alpha: 0.7),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 20),
+                  
+                  // Refresh button
+                  SizedBox(
+                    width: double.infinity,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        setState(() => _showInstallDialog = false);
+                        _detectBackend();
+                      },
+                      icon: const Icon(Icons.refresh, size: 18),
+                      label: const Text('Refresh Detection'),
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFF00E5FF),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInstallOption({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required String command,
+    bool isUrl = false,
+    VoidCallback? onInstall,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.03),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.06),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: const Color(0xFF00E5FF), size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                        color: Colors.white,
+                      ),
+                    ),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: Colors.white.withValues(alpha: 0.5),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.3),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    command,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'Consolas',
+                      color: isUrl ? const Color(0xFF00E5FF) : Colors.white.withValues(alpha: 0.8),
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconButton(
+                onPressed: () => _copyCommand(command),
+                icon: const Icon(Icons.copy, size: 18),
+                color: Colors.white.withValues(alpha: 0.5),
+                tooltip: 'Copy',
+              ),
+              if (onInstall != null) ...[
+                const SizedBox(width: 4),
+                ElevatedButton(
+                  onPressed: onInstall,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00E5FF),
+                    foregroundColor: Colors.black,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text(
+                    'Install',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GridPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.02)
+      ..strokeWidth = 1;
+
+    const spacing = 40.0;
+
+    for (double x = 0; x < size.width; x += spacing) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+    }
+    for (double y = 0; y < size.height; y += spacing) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
