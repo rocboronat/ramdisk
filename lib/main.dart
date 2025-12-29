@@ -44,15 +44,17 @@ class _RamDiskScreenState extends State<RamDiskScreen>
   bool _isLoading = false;
   String _statusMessage = 'Checking for RAM disk driver...';
   String _driveLetter = 'R';
-  final int _sizeGB = 1;
+  double _sizeGB = 1.0;
   late AnimationController _pulseController;
   late Animation<double> _pulseAnimation;
   RamDiskBackend _backend = RamDiskBackend.none;
   bool _showInstallDialog = false;
+  late TextEditingController _sizeController;
 
   @override
   void initState() {
     super.initState();
+    _sizeController = TextEditingController(text: _sizeGB.toString());
     _pulseController = AnimationController(
       duration: const Duration(milliseconds: 1500),
       vsync: this,
@@ -66,6 +68,7 @@ class _RamDiskScreenState extends State<RamDiskScreen>
   @override
   void dispose() {
     _pulseController.dispose();
+    _sizeController.dispose();
     super.dispose();
   }
 
@@ -151,7 +154,10 @@ class _RamDiskScreenState extends State<RamDiskScreen>
     });
 
     try {
-      final sizeBytes = _sizeGB * 1024 * 1024 * 1024;
+      final sizeBytes = (_sizeGB * 1024 * 1024 * 1024).round();
+      final sizeDisplay = _sizeGB == _sizeGB.roundToDouble() 
+          ? '${_sizeGB.toInt()}GB' 
+          : '${_sizeGB}GB';
       
       if (_backend == RamDiskBackend.imdisk) {
         // Create RAM disk using ImDisk
@@ -164,7 +170,7 @@ class _RamDiskScreenState extends State<RamDiskScreen>
         if (result.exitCode == 0) {
           setState(() {
             _isRunning = true;
-            _statusMessage = 'RAM Disk active on $_driveLetter: (${_sizeGB}GB)';
+            _statusMessage = 'RAM Disk active on $_driveLetter: ($sizeDisplay)';
           });
           _pulseController.repeat(reverse: true);
         } else {
@@ -523,13 +529,53 @@ class _RamDiskScreenState extends State<RamDiskScreen>
           ),
           const SizedBox(width: 40),
           _buildSettingItem(
-            'SIZE',
-            Text(
-              '${_sizeGB}GB',
-              style: const TextStyle(
-                color: Color(0xFF00E5FF),
-                fontSize: 15,
-                fontWeight: FontWeight.w500,
+            'SIZE (GB)',
+            SizedBox(
+              width: 70,
+              child: TextField(
+                controller: _sizeController,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF00E5FF),
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                ),
+                decoration: InputDecoration(
+                  isDense: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.1),
+                    ),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.1),
+                    ),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(8),
+                    borderSide: const BorderSide(
+                      color: Color(0xFF00E5FF),
+                    ),
+                  ),
+                  filled: true,
+                  fillColor: Colors.black.withValues(alpha: 0.3),
+                ),
+                inputFormatters: [
+                  FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*')),
+                ],
+                onChanged: (value) {
+                  final parsed = double.tryParse(value);
+                  if (parsed != null && parsed > 0) {
+                    setState(() {
+                      _sizeGB = parsed;
+                    });
+                  }
+                },
               ),
             ),
           ),
