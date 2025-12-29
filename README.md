@@ -2,8 +2,6 @@
 
 A sleek Windows application for creating and managing RAM disks.
 
-![Screenshot](docs/screenshot.png)
-
 ## Requirements
 
 ### ImDisk Toolkit
