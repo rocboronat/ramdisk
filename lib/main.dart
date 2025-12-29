@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -50,6 +51,13 @@ class _RamDiskScreenState extends State<RamDiskScreen>
   RamDiskBackend _backend = RamDiskBackend.none;
   bool _showInstallDialog = false;
   late TextEditingController _sizeController;
+  bool _persistenceEnabled = true;
+
+  /// Get the backup directory path for the current drive letter
+  String get _backupPath {
+    final userProfile = Platform.environment['USERPROFILE'] ?? '';
+    return '$userProfile\\.memdisk\\$_driveLetter';
+  }
 
   @override
   void initState() {
@@ -98,6 +106,97 @@ class _RamDiskScreenState extends State<RamDiskScreen>
       _isLoading = false;
       _showInstallDialog = true;
     });
+  }
+
+  /// Check if backup exists for the current drive letter
+  Future<bool> _backupExists() async {
+    final dir = Directory(_backupPath);
+    return await dir.exists();
+  }
+
+  /// Restore contents from backup to the RAM disk
+  Future<bool> _restoreFromBackup() async {
+    if (!_persistenceEnabled) return true;
+    
+    final backupDir = Directory(_backupPath);
+    if (!await backupDir.exists()) {
+      return true; // No backup to restore, that's OK
+    }
+
+    setState(() {
+      _statusMessage = 'Restoring data from backup...';
+    });
+
+    try {
+      // Use robocopy to restore files (mirrors the backup to the RAM disk)
+      final result = await Process.run(
+        'robocopy',
+        [
+          _backupPath,
+          '$_driveLetter:\\',
+          '/E',      // Copy subdirectories including empty ones
+          '/R:1',    // 1 retry
+          '/W:1',    // 1 second wait
+          '/NJH',    // No job header
+          '/NJS',    // No job summary
+          '/NDL',    // No directory list
+          '/NC',     // No file class
+          '/NS',     // No file size
+          '/NP',     // No progress
+          '/XD', 'System Volume Information', '\$RECYCLE.BIN', // Exclude system dirs
+          '/XF', '*.sys', 'pagefile.sys', 'hiberfil.sys',      // Exclude system files
+        ],
+        runInShell: true,
+      );
+      
+      // Robocopy returns 0-7 for success, 8+ for errors
+      return result.exitCode < 8;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Save RAM disk contents to backup
+  Future<bool> _saveToBackup() async {
+    if (!_persistenceEnabled) return true;
+    
+    setState(() {
+      _statusMessage = 'Saving data to backup...';
+    });
+
+    try {
+      // Ensure backup directory exists
+      final backupDir = Directory(_backupPath);
+      if (!await backupDir.exists()) {
+        await backupDir.create(recursive: true);
+      }
+
+      // Use robocopy to save files (mirrors the RAM disk to backup)
+      final result = await Process.run(
+        'robocopy',
+        [
+          '$_driveLetter:\\',
+          _backupPath,
+          '/MIR',    // Mirror mode
+          '/R:1',    // 1 retry
+          '/W:1',    // 1 second wait
+          '/NJH',    // No job header
+          '/NJS',    // No job summary
+          '/NDL',    // No directory list
+          '/NC',     // No file class
+          '/NS',     // No file size
+          '/NP',     // No progress
+          '/XD', 'System Volume Information', '\$RECYCLE.BIN', // Exclude system dirs
+          '/XF', '*.sys', 'pagefile.sys', 'hiberfil.sys',      // Exclude system files
+        ],
+        runInShell: true,
+      );
+      
+      // Robocopy returns 0-7 for success, 8+ for errors
+      return result.exitCode < 8;
+    } catch (e) {
+      return false;
+    }
   }
 
   Future<void> _installImDisk() async {
@@ -163,14 +262,111 @@ class _RamDiskScreenState extends State<RamDiskScreen>
         // Create RAM disk using ImDisk
         final result = await Process.run(
           'imdisk',
-          ['-a', '-s', '$sizeBytes', '-m', '$_driveLetter:', '-p', '/fs:ntfs /q /y'],
+          ['-a', '-s', '$sizeBytes', '-m', '$_driveLetter:', '-o', 'rem'],
           runInShell: true,
         );
 
         if (result.exitCode == 0) {
           setState(() {
+            _statusMessage = 'Formatting RAM Disk...';
+          });
+          
+          // Wait for Windows to recognize the new volume
+          await Future.delayed(const Duration(seconds: 1));
+          
+          // Create a diskpart script file
+          final tempDir = Directory.systemTemp;
+          final scriptFile = File('${tempDir.path}\\memdisk_format.txt');
+          await scriptFile.writeAsString('select volume $_driveLetter\nformat fs=ntfs quick label=RAMDISK\n');
+          
+          // Run diskpart with the script
+          final diskpartResult = await Process.run(
+            'diskpart',
+            ['/s', scriptFile.path],
+            runInShell: true,
+          );
+          
+          // Clean up script file
+          try {
+            await scriptFile.delete();
+          } catch (_) {}
+          
+          // If diskpart failed, try PowerShell Initialize-Disk + Format-Volume
+          if (diskpartResult.exitCode != 0) {
+            await Process.run(
+              'powershell',
+              [
+                '-NoProfile',
+                '-Command',
+                '''
+                \$vol = Get-Volume -DriveLetter $_driveLetter -ErrorAction SilentlyContinue
+                if (\$vol) {
+                  Format-Volume -DriveLetter $_driveLetter -FileSystem NTFS -NewFileSystemLabel RAMDISK -Confirm:\$false -Force
+                }
+                '''
+              ],
+              runInShell: true,
+            );
+          }
+          
+          // Wait for format to complete
+          await Future.delayed(const Duration(seconds: 2));
+          
+          // Verify the drive is accessible by trying to list it
+          bool driveReady = false;
+          for (int i = 0; i < 5; i++) {
+            try {
+              final dir = Directory('$_driveLetter:\\');
+              await dir.list().first.timeout(
+                const Duration(seconds: 2),
+                onTimeout: () => throw TimeoutException('Drive not ready'),
+              );
+              driveReady = true;
+              break;
+            } catch (_) {
+              // Drive not ready yet, wait and retry
+              await Future.delayed(const Duration(milliseconds: 500));
+            }
+          }
+          
+          if (!driveReady) {
+            // Try one more approach - just check if we can create a temp file
+            try {
+              final testFile = File('$_driveLetter:\\__memdisk_test__');
+              await testFile.writeAsString('test');
+              await testFile.delete();
+              driveReady = true;
+            } catch (_) {
+              setState(() {
+                _statusMessage = 'Warning: Drive may not be ready';
+              });
+              await Future.delayed(const Duration(seconds: 1));
+            }
+          }
+          
+          // Check if we have a backup to restore
+          final hasBackup = await _backupExists();
+          
+          if (hasBackup && _persistenceEnabled) {
+            setState(() {
+              _statusMessage = 'Restoring previous data...';
+            });
+            
+            final restored = await _restoreFromBackup();
+            if (!restored) {
+              // Restoration failed but disk is created, continue anyway
+              setState(() {
+                _statusMessage = 'Warning: Could not restore backup';
+              });
+              await Future.delayed(const Duration(seconds: 1));
+            }
+          }
+          
+          setState(() {
             _isRunning = true;
-            _statusMessage = 'RAM Disk active on $_driveLetter: ($sizeDisplay)';
+            _statusMessage = hasBackup && _persistenceEnabled
+                ? 'RAM Disk active on $_driveLetter: ($sizeDisplay) — Data restored'
+                : 'RAM Disk active on $_driveLetter: ($sizeDisplay)';
           });
           _pulseController.repeat(reverse: true);
         } else {
@@ -194,10 +390,26 @@ class _RamDiskScreenState extends State<RamDiskScreen>
   Future<void> _stopRamDisk() async {
     setState(() {
       _isLoading = true;
-      _statusMessage = 'Removing RAM Disk...';
+      _statusMessage = 'Saving data...';
     });
 
     try {
+      // Save data before unmounting
+      if (_persistenceEnabled) {
+        final saved = await _saveToBackup();
+        if (!saved) {
+          // Ask user if they want to continue without saving
+          setState(() {
+            _statusMessage = 'Warning: Could not save data. Unmounting anyway...';
+          });
+          await Future.delayed(const Duration(seconds: 1));
+        }
+      }
+
+      setState(() {
+        _statusMessage = 'Unmounting RAM Disk...';
+      });
+
       if (_backend == RamDiskBackend.imdisk) {
         var result = await Process.run(
           'imdisk',
@@ -219,7 +431,9 @@ class _RamDiskScreenState extends State<RamDiskScreen>
           _pulseController.reset();
           setState(() {
             _isRunning = false;
-            _statusMessage = 'RAM Disk stopped';
+            _statusMessage = _persistenceEnabled 
+                ? 'RAM Disk stopped — Data saved'
+                : 'RAM Disk stopped';
           });
         } else {
           setState(() {
@@ -576,6 +790,27 @@ class _RamDiskScreenState extends State<RamDiskScreen>
                     });
                   }
                 },
+              ),
+            ),
+          ),
+          const SizedBox(width: 40),
+          _buildSettingItem(
+            'PERSIST',
+            Tooltip(
+              message: _persistenceEnabled 
+                  ? 'Data will be saved when stopped\nBackup: $_backupPath'
+                  : 'Data will be lost when stopped',
+              child: Switch(
+                value: _persistenceEnabled,
+                onChanged: (value) {
+                  setState(() {
+                    _persistenceEnabled = value;
+                  });
+                },
+                activeColor: const Color(0xFF00E5FF),
+                activeTrackColor: const Color(0xFF00E5FF).withValues(alpha: 0.3),
+                inactiveThumbColor: Colors.white.withValues(alpha: 0.5),
+                inactiveTrackColor: Colors.white.withValues(alpha: 0.1),
               ),
             ),
           ),
